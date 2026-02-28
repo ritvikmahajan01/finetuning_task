@@ -13,7 +13,14 @@ The assignment also allows prompt variants during training, including:
 - `segment joint/tape`
 - `segment drywall seam`
 
-This repository currently contains dataset exports and the assignment PDF, not a training pipeline. The checked-in assets are two Roboflow COCO datasets:
+This repository now contains:
+
+- the assignment PDF
+- the two Roboflow COCO datasets
+- zero-shot baseline scripts
+- a first-pass CLIPSeg fine-tuning script for a combined prompted model
+
+The checked-in dataset assets are:
 
 - `cracks.coco`
 - `Drywall-Join-Detect.coco`
@@ -26,6 +33,10 @@ Both datasets are exported as COCO JSON under a single `train/` directory, with 
 .
 ├── README.md
 ├── Prompted_Segmentation_for_Drywall_QA.pdf
+├── scripts/
+│   ├── finetune_clipseg.py
+│   ├── grounded_sam_baseline.py
+│   └── zero_shot_clipseg_baseline.py
 ├── cracks.coco/
 │   ├── README.roboflow.txt
 │   └── train/
@@ -39,6 +50,125 @@ Both datasets are exported as COCO JSON under a single `train/` directory, with 
 ```
 
 There are no `val/` or `test/` splits in the current export.
+
+## Implemented Training Approach
+
+The main training path in this repository is a single combined fine-tune using `CLIPSeg`, not two separate models.
+
+Why this is the default:
+
+- the assignment is explicitly text-conditioned
+- one model can learn both tasks via prompt selection
+- this keeps the final system aligned with the required interface: `image + prompt -> mask`
+
+The training script is [scripts/finetune_clipseg.py](/home/ritvik/finetuning_task/scripts/finetune_clipseg.py).
+
+### Fine-Tuning Strategy
+
+The script uses a conservative first-pass fine-tuning setup:
+
+- one shared `CLIPSeg` model across both datasets
+- train the segmentation decoder by default
+- keep most of the CLIP backbone frozen
+- optionally unfreeze the last few vision layers with `--unfreeze-vision-layers`
+
+This is standard partial fine-tuning, not LoRA.
+
+### Prompt Policy
+
+During training, the script samples prompt variants for robustness.
+
+Crack prompts:
+
+- `segment crack`
+- `segment wall crack`
+- `segment structural crack`
+- `segment surface crack`
+
+Drywall prompts:
+
+- `segment taping area`
+- `segment joint/tape`
+- `segment drywall seam`
+- `segment drywall joint`
+
+During validation and test, the script uses canonical prompts only:
+
+- `segment crack`
+- `segment taping area`
+
+### Loss Design
+
+The training loss is:
+
+- weighted binary cross-entropy
+- plus Dice loss
+
+The implementation also applies task-specific weighting:
+
+- crack samples get a stronger positive-pixel weight because cracks are sparse
+- drywall samples get a lower sample weight because their masks are weak labels derived from boxes
+
+### Data Splits
+
+The script creates deterministic train/validation/test splits from the checked-in `train/` exports:
+
+- default split is `70 / 15 / 15`
+- each dataset is split separately first, then combined
+
+This avoids the smaller drywall set being overwhelmed by the crack dataset.
+
+## How To Run Training
+
+Install the required Python packages if needed:
+
+```bash
+pip install torch transformers pillow numpy
+```
+
+Run a small sanity-check experiment first:
+
+```bash
+python3 scripts/finetune_clipseg.py \
+  --output-dir runs/clipseg_smoke_test \
+  --epochs 2 \
+  --batch-size 2 \
+  --limit-per-dataset 100
+```
+
+Run a larger first-pass training job:
+
+```bash
+python3 scripts/finetune_clipseg.py \
+  --output-dir runs/clipseg_combined \
+  --epochs 4 \
+  --batch-size 4 \
+  --learning-rate 1e-4
+```
+
+Useful options:
+
+- `--unfreeze-vision-layers 2` to fine-tune the last two CLIP vision layers in addition to the decoder
+- `--device cpu` to force CPU training
+- `--limit-per-dataset N` for faster debugging
+
+Training outputs are saved under the chosen `--output-dir`:
+
+- `run_config.json`
+- `history.json`
+- `best_model/`
+- `test_metrics.json`
+
+The saved `best_model/` directory contains the best validation checkpoint in Hugging Face format.
+
+## Baselines
+
+Two zero-shot baselines are also included:
+
+- [scripts/zero_shot_clipseg_baseline.py](/home/ritvik/finetuning_task/scripts/zero_shot_clipseg_baseline.py)
+- [scripts/grounded_sam_baseline.py](/home/ritvik/finetuning_task/scripts/grounded_sam_baseline.py)
+
+The Grounding DINO + SAM baseline is expected to be stronger than zero-shot CLIPSeg, but the recommended trainable submission path is still fine-tuned `CLIPSeg`, because it is directly designed for text-conditioned segmentation.
 
 ## Dataset Summary
 
