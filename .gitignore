@@ -1,2 +1,4 @@
 /runs
 /outputs
+/venv
+/scripts/grounded_sam_baseline.py

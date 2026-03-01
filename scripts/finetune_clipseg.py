@@ -4,7 +4,7 @@ Fine-tune CLIPSeg on the combined crack + drywall datasets.
 
 This script is intentionally simple and explicit:
 - it reads the two COCO exports already present in this repository
-- it generates binary masks on-the-fly from stored annotations (lazy, not preloaded)
+- it builds binary masks from stored annotations (cached at dataset init for speed)
 - it trains one text-conditioned model across both tasks
 - it uses prompt variants during training and canonical prompts for validation/test
 - it treats drywall labels as weak supervision because that dataset only contains boxes
@@ -526,10 +526,16 @@ def evaluate(
     task_ious: List[float] = []
     task_dices: List[float] = []
     for dataset_name in sorted(per_task_iou):
-        mean_iou = float(sum(per_task_iou[dataset_name]) / len(per_task_iou[dataset_name]))
-        mean_dice = float(sum(per_task_dice[dataset_name]) / len(per_task_dice[dataset_name]))
+        ious = per_task_iou[dataset_name]
+        dices = per_task_dice[dataset_name]
+        mean_iou = float(np.mean(ious))
+        mean_dice = float(np.mean(dices))
         metrics[f"{dataset_name}_iou"] = mean_iou
         metrics[f"{dataset_name}_dice"] = mean_dice
+        metrics[f"{dataset_name}_iou_std"] = float(np.std(ious))
+        metrics[f"{dataset_name}_dice_std"] = float(np.std(dices))
+        metrics[f"{dataset_name}_iou_min"] = float(np.min(ious))
+        metrics[f"{dataset_name}_dice_min"] = float(np.min(dices))
         task_ious.append(mean_iou)
         task_dices.append(mean_dice)
 
@@ -568,6 +574,125 @@ def get_cosine_schedule_with_warmup(
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def search_thresholds(
+    model: CLIPSegForImageSegmentation,
+    loader: DataLoader,
+    device: str,
+    use_amp: bool = False,
+    candidates: Sequence[float] = (0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8),
+) -> Dict[str, Dict[str, float]]:
+    """Sweep thresholds on the val set and return the best per-task threshold."""
+    model.eval()
+
+    # Collect per-sample sigmoid probs and GT masks, grouped by dataset.
+    per_task_data: Dict[str, List[Tuple[torch.Tensor, torch.Tensor]]] = {}
+
+    with torch.inference_mode():
+        for batch in loader:
+            batch = move_tensor_batch_to_device(batch, device)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    pixel_values=batch["pixel_values"],
+                )
+                logits = normalize_logits_shape(outputs.logits)
+                targets = batch["masks"].unsqueeze(1)
+                logits = nn.functional.interpolate(
+                    logits, size=targets.shape[-2:], mode="bilinear", align_corners=False,
+                )
+            probs = torch.sigmoid(logits).cpu()
+            targets_cpu = targets.cpu()
+            for idx, dataset_name in enumerate(batch["dataset_names"]):
+                per_task_data.setdefault(dataset_name, []).append(
+                    (probs[idx], targets_cpu[idx])
+                )
+
+    best_thresholds: Dict[str, Dict[str, float]] = {}
+    for dataset_name in sorted(per_task_data):
+        best_iou = -1.0
+        best_t = 0.5
+        for t in candidates:
+            ious: List[float] = []
+            for prob, gt in per_task_data[dataset_name]:
+                pred = prob >= t
+                gt_bool = gt >= 0.5
+                intersection = torch.logical_and(pred, gt_bool).sum().item()
+                union = torch.logical_or(pred, gt_bool).sum().item()
+                ious.append(float(intersection / union) if union else 1.0)
+            mean_iou = sum(ious) / len(ious)
+            if mean_iou > best_iou:
+                best_iou = mean_iou
+                best_t = t
+        best_thresholds[dataset_name] = {"threshold": best_t, "iou": best_iou}
+
+    return best_thresholds
+
+
+def evaluate_with_per_task_thresholds(
+    model: CLIPSegForImageSegmentation,
+    loader: DataLoader,
+    device: str,
+    thresholds: Dict[str, Dict[str, float]],
+    use_amp: bool = False,
+) -> Dict[str, float]:
+    """Like evaluate() but uses per-task optimal thresholds instead of a single global one."""
+    model.eval()
+    per_task_iou: Dict[str, List[float]] = {}
+    per_task_dice: Dict[str, List[float]] = {}
+
+    with torch.inference_mode():
+        for batch in loader:
+            batch = move_tensor_batch_to_device(batch, device)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    pixel_values=batch["pixel_values"],
+                )
+                logits = normalize_logits_shape(outputs.logits)
+                targets = batch["masks"].unsqueeze(1)
+                logits = nn.functional.interpolate(
+                    logits, size=targets.shape[-2:], mode="bilinear", align_corners=False,
+                )
+            probs = torch.sigmoid(logits)
+            gts = targets >= 0.5
+
+            for idx, dataset_name in enumerate(batch["dataset_names"]):
+                t = thresholds.get(dataset_name, {}).get("threshold", 0.5)
+                pred = probs[idx] >= t
+                gt = gts[idx]
+                intersection = torch.logical_and(pred, gt).sum().item()
+                union = torch.logical_or(pred, gt).sum().item()
+                pred_sum = pred.sum().item()
+                gt_sum = gt.sum().item()
+                iou = float(intersection / union) if union else 1.0
+                dice = float((2.0 * intersection) / (pred_sum + gt_sum)) if (pred_sum + gt_sum) else 1.0
+                per_task_iou.setdefault(dataset_name, []).append(iou)
+                per_task_dice.setdefault(dataset_name, []).append(dice)
+
+    metrics: Dict[str, float] = {}
+    task_ious: List[float] = []
+    task_dices: List[float] = []
+    for dataset_name in sorted(per_task_iou):
+        ious = per_task_iou[dataset_name]
+        dices = per_task_dice[dataset_name]
+        mean_iou = float(np.mean(ious))
+        mean_dice = float(np.mean(dices))
+        metrics[f"{dataset_name}_iou"] = mean_iou
+        metrics[f"{dataset_name}_dice"] = mean_dice
+        metrics[f"{dataset_name}_iou_std"] = float(np.std(ious))
+        metrics[f"{dataset_name}_dice_std"] = float(np.std(dices))
+        metrics[f"{dataset_name}_iou_min"] = float(np.min(ious))
+        metrics[f"{dataset_name}_dice_min"] = float(np.min(dices))
+        task_ious.append(mean_iou)
+        task_dices.append(mean_dice)
+
+    metrics["macro_iou"] = float(sum(task_ious) / len(task_ious)) if task_ious else 0.0
+    metrics["macro_dice"] = float(sum(task_dices) / len(task_dices)) if task_dices else 0.0
+    return metrics
 
 
 def main() -> None:
@@ -775,10 +900,21 @@ def main() -> None:
         model = CLIPSegForImageSegmentation.from_pretrained(best_model_dir)
         model.to(args.device)
 
-    test_metrics = evaluate(
-        model, test_loader, device=args.device, threshold=args.eval_threshold, use_amp=use_amp,
+    # --- Threshold search on validation set ---
+    print("\nthreshold_search (on val set)")
+    best_thresholds = search_thresholds(
+        model, val_loader, device=args.device, use_amp=use_amp,
+    )
+    for task_name, info in sorted(best_thresholds.items()):
+        print(f"  {task_name}: threshold={info['threshold']:.2f} iou={info['iou']:.4f}")
+    save_json(best_thresholds, args.output_dir / "best_thresholds.json")
+
+    # --- Final test evaluation with optimal thresholds ---
+    test_metrics = evaluate_with_per_task_thresholds(
+        model, test_loader, device=args.device, thresholds=best_thresholds, use_amp=use_amp,
     )
     test_metrics["training_time_seconds"] = round(train_elapsed, 1)
+    test_metrics["thresholds"] = {k: v["threshold"] for k, v in best_thresholds.items()}
     save_json(test_metrics, args.output_dir / "test_metrics.json")
 
     print("test_metrics")

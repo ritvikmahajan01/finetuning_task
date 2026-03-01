@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -110,11 +111,6 @@ def load_json(path: Path) -> dict:
         return json.load(handle)
 
 
-def load_coco(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
 def build_annotation_index(annotations: Iterable[dict]) -> Dict[int, List[dict]]:
     index: Dict[int, List[dict]] = {}
     for ann in annotations:
@@ -164,7 +160,7 @@ def build_records(limit_per_dataset: int | None) -> List[SampleRecord]:
     for dataset_name, cfg in DATASET_CONFIGS.items():
         root = Path(str(cfg["root"]))
         annotations_path = Path(str(cfg["annotations"]))
-        coco = load_coco(annotations_path)
+        coco = load_json(annotations_path)
         ann_index = build_annotation_index(coco["annotations"])
         image_records = coco["images"]
         if limit_per_dataset is not None:
@@ -283,18 +279,16 @@ def create_overlay(
     color: Tuple[int, int, int],
     alpha: int = 110,
 ) -> Image.Image:
-    base = image.convert("RGBA")
-    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    overlay_pixels = overlay.load()
+    base = np.array(image.convert("RGB"), dtype=np.float32)
     mask_bool = mask > 0
-
-    width, height = base.size
-    for y in range(height):
-        for x in range(width):
-            if mask_bool[y, x]:
-                overlay_pixels[x, y] = (color[0], color[1], color[2], alpha)
-
-    return Image.alpha_composite(base, overlay).convert("RGB")
+    alpha_f = alpha / 255.0
+    for c in range(3):
+        base[..., c] = np.where(
+            mask_bool,
+            base[..., c] * (1.0 - alpha_f) + color[c] * alpha_f,
+            base[..., c],
+        )
+    return Image.fromarray(base.astype(np.uint8))
 
 
 def save_comparison(
@@ -317,19 +311,17 @@ def save_comparison(
 
     width, height = original.size
     header_height = 64
-    canvas = Image.new("RGB", (width * 4, height + header_height), color=(255, 255, 255))
-    canvas.paste(original, (0, header_height))
-    canvas.paste(gt_panel, (width, header_height))
-    canvas.paste(base_panel, (width * 2, header_height))
-    canvas.paste(ft_panel, (width * 3, header_height))
+    canvas = Image.new("RGB", (width * 3, height + header_height), color=(255, 255, 255))
+    canvas.paste(gt_panel, (0, header_height))
+    canvas.paste(base_panel, (width, header_height))
+    canvas.paste(ft_panel, (width * 2, header_height))
 
     draw = ImageDraw.Draw(canvas)
-    draw.text((10, 8), "Original", fill=(0, 0, 0))
-    draw.text((width + 10, 8), "Ground Truth", fill=(0, 0, 0))
-    draw.text((width * 2 + 10, 8), "Base CLIPSeg", fill=(0, 0, 0))
-    draw.text((width * 3 + 10, 8), "Fine-Tuned CLIPSeg", fill=(0, 0, 0))
-    draw.text((width * 2 + 10, 28), f"IoU={base_iou:.4f} Dice={base_dice:.4f}", fill=(0, 0, 0))
-    draw.text((width * 3 + 10, 28), f"IoU={ft_iou:.4f} Dice={ft_dice:.4f}", fill=(0, 0, 0))
+    draw.text((10, 8), "Ground Truth", fill=(0, 0, 0))
+    draw.text((width + 10, 8), "Base CLIPSeg", fill=(0, 0, 0))
+    draw.text((width * 2 + 10, 8), "Fine-Tuned CLIPSeg", fill=(0, 0, 0))
+    draw.text((width + 10, 28), f"IoU={base_iou:.4f} Dice={base_dice:.4f}", fill=(0, 0, 0))
+    draw.text((width * 2 + 10, 28), f"IoU={ft_iou:.4f} Dice={ft_dice:.4f}", fill=(0, 0, 0))
 
     canvas.save(path)
 
@@ -368,9 +360,18 @@ def main() -> None:
     val_ratio = float(run_config.get("val_ratio", 0.15))
     seed = int(run_config.get("seed", 7))
     limit_per_dataset = run_config.get("limit_per_dataset")
-    eval_threshold = float(
+    base_threshold = float(
         args.threshold if args.threshold is not None else run_config.get("eval_threshold", 0.5)
     )
+
+    # Load per-task optimal thresholds from training (for fine-tuned model).
+    best_thresholds_path = args.run_dir / "best_thresholds.json"
+    per_task_thresholds: Dict[str, float] = {}
+    if args.threshold is None and best_thresholds_path.exists():
+        raw = load_json(best_thresholds_path)
+        for task_name, info in raw.items():
+            per_task_thresholds[task_name] = float(info["threshold"])
+        print(f"loaded per-task thresholds: {per_task_thresholds}")
 
     records = build_records(limit_per_dataset=limit_per_dataset)
     train_records, val_records, test_records = split_records(
@@ -394,22 +395,28 @@ def main() -> None:
     base_model.eval()
     fine_tuned_model.eval()
 
-    base_ious: List[float] = []
-    base_dices: List[float] = []
-    ft_ious: List[float] = []
-    ft_dices: List[float] = []
-    delta_ious: List[float] = []
-    delta_dices: List[float] = []
+    # Per-task tracking.
+    per_task_base_iou: Dict[str, List[float]] = {}
+    per_task_base_dice: Dict[str, List[float]] = {}
+    per_task_ft_iou: Dict[str, List[float]] = {}
+    per_task_ft_dice: Dict[str, List[float]] = {}
+    inference_times: List[float] = []
 
     print(f"split={args.split}")
     print(f"images_evaluated={len(selected_records)}")
-    print(f"threshold={eval_threshold:.4f}")
+    print(f"base_threshold={base_threshold:.4f}")
+    if per_task_thresholds:
+        print(f"fine_tuned_thresholds={per_task_thresholds}")
+    else:
+        print(f"fine_tuned_threshold={base_threshold:.4f}")
     print()
     print("sample_results")
 
     for record in selected_records:
         image = Image.open(record.image_path).convert("RGB")
         gt_mask = record.mask
+
+        t0 = time.perf_counter()
 
         base_mask = predict_mask(
             model=base_model,
@@ -418,9 +425,10 @@ def main() -> None:
             prompt=record.canonical_prompt,
             width=record.width,
             height=record.height,
-            threshold=eval_threshold,
+            threshold=base_threshold,
             device=args.device,
         )
+        ft_threshold = per_task_thresholds.get(record.dataset_name, base_threshold)
         ft_mask = predict_mask(
             model=fine_tuned_model,
             processor=processor,
@@ -428,19 +436,21 @@ def main() -> None:
             prompt=record.canonical_prompt,
             width=record.width,
             height=record.height,
-            threshold=eval_threshold,
+            threshold=ft_threshold,
             device=args.device,
         )
+
+        t1 = time.perf_counter()
+        inference_times.append(t1 - t0)
 
         base_iou, base_dice = compute_iou_and_dice(base_mask, gt_mask)
         ft_iou, ft_dice = compute_iou_and_dice(ft_mask, gt_mask)
 
-        base_ious.append(base_iou)
-        base_dices.append(base_dice)
-        ft_ious.append(ft_iou)
-        ft_dices.append(ft_dice)
-        delta_ious.append(ft_iou - base_iou)
-        delta_dices.append(ft_dice - base_dice)
+        dn = record.dataset_name
+        per_task_base_iou.setdefault(dn, []).append(base_iou)
+        per_task_base_dice.setdefault(dn, []).append(base_dice)
+        per_task_ft_iou.setdefault(dn, []).append(ft_iou)
+        per_task_ft_dice.setdefault(dn, []).append(ft_dice)
 
         print(
             f"{record.dataset_name}\t{record.file_name}\t"
@@ -463,14 +473,62 @@ def main() -> None:
                 path=args.save_dir / file_name,
             )
 
+    # --- Aggregate metrics ---
+    avg_time = sum(inference_times) / len(inference_times) if inference_times else 0.0
     print()
     print("aggregate_metrics")
-    print(f"base_mean_iou={summarize(base_ious):.4f}")
-    print(f"base_mean_dice={summarize(base_dices):.4f}")
-    print(f"fine_tuned_mean_iou={summarize(ft_ious):.4f}")
-    print(f"fine_tuned_mean_dice={summarize(ft_dices):.4f}")
-    print(f"mean_iou_gain={summarize(delta_ious):.4f}")
-    print(f"mean_dice_gain={summarize(delta_dices):.4f}")
+    print(f"  avg_inference_time={avg_time*1000:.1f}ms (both models per image)")
+
+    results: Dict[str, object] = {
+        "split": args.split,
+        "total_images": len(inference_times),
+        "avg_inference_time_ms": round(avg_time * 1000, 1),
+    }
+
+    for dataset_name in sorted(per_task_ft_iou):
+        b_ious = np.array(per_task_base_iou[dataset_name])
+        b_dices = np.array(per_task_base_dice[dataset_name])
+        f_ious = np.array(per_task_ft_iou[dataset_name])
+        f_dices = np.array(per_task_ft_dice[dataset_name])
+
+        print(f"\n  [{dataset_name}] (n={len(f_ious)})")
+        print(f"    base:       iou={b_ious.mean():.4f} (std={b_ious.std():.4f}, min={b_ious.min():.4f})  dice={b_dices.mean():.4f} (std={b_dices.std():.4f}, min={b_dices.min():.4f})")
+        print(f"    fine-tuned: iou={f_ious.mean():.4f} (std={f_ious.std():.4f}, min={f_ious.min():.4f})  dice={f_dices.mean():.4f} (std={f_dices.std():.4f}, min={f_dices.min():.4f})")
+        print(f"    gain:       iou={f_ious.mean() - b_ious.mean():+.4f}  dice={f_dices.mean() - b_dices.mean():+.4f}")
+
+        results[f"{dataset_name}_base_iou"] = round(float(b_ious.mean()), 4)
+        results[f"{dataset_name}_base_dice"] = round(float(b_dices.mean()), 4)
+        results[f"{dataset_name}_ft_iou"] = round(float(f_ious.mean()), 4)
+        results[f"{dataset_name}_ft_iou_std"] = round(float(f_ious.std()), 4)
+        results[f"{dataset_name}_ft_iou_min"] = round(float(f_ious.min()), 4)
+        results[f"{dataset_name}_ft_dice"] = round(float(f_dices.mean()), 4)
+        results[f"{dataset_name}_ft_dice_std"] = round(float(f_dices.std()), 4)
+        results[f"{dataset_name}_ft_dice_min"] = round(float(f_dices.min()), 4)
+        results[f"{dataset_name}_iou_gain"] = round(float(f_ious.mean() - b_ious.mean()), 4)
+        results[f"{dataset_name}_dice_gain"] = round(float(f_dices.mean() - b_dices.mean()), 4)
+
+    # Macro averages.
+    macro_base_iou = float(np.mean([np.mean(v) for v in per_task_base_iou.values()]))
+    macro_ft_iou = float(np.mean([np.mean(v) for v in per_task_ft_iou.values()]))
+    macro_base_dice = float(np.mean([np.mean(v) for v in per_task_base_dice.values()]))
+    macro_ft_dice = float(np.mean([np.mean(v) for v in per_task_ft_dice.values()]))
+
+    print(f"\n  [macro]")
+    print(f"    base:       iou={macro_base_iou:.4f}  dice={macro_base_dice:.4f}")
+    print(f"    fine-tuned: iou={macro_ft_iou:.4f}  dice={macro_ft_dice:.4f}")
+    print(f"    gain:       iou={macro_ft_iou - macro_base_iou:+.4f}  dice={macro_ft_dice - macro_base_dice:+.4f}")
+
+    results["macro_base_iou"] = round(macro_base_iou, 4)
+    results["macro_base_dice"] = round(macro_base_dice, 4)
+    results["macro_ft_iou"] = round(macro_ft_iou, 4)
+    results["macro_ft_dice"] = round(macro_ft_dice, 4)
+
+    if args.save_dir:
+        results_path = args.save_dir / "compare_results.json"
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        with results_path.open("w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, sort_keys=True)
+        print(f"\nsaved results to {results_path}")
 
 
 if __name__ == "__main__":

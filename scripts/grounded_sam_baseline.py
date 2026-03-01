@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        default="cpu",
+        default="cuda" if torch.cuda.is_available() else "cpu",
         help="Inference device.",
     )
     parser.add_argument(
