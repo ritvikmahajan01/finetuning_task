@@ -91,6 +91,9 @@ class PromptedSegmentationDataset(Dataset):
     """
     Dataset wrapper that generates masks on-the-fly from stored annotations
     and applies augmentations for the training split.
+
+    Masks are cached once at dataset construction time so repeated epochs do not
+    rebuild the same polygon/box masks over and over.
     """
 
     def __init__(
@@ -104,6 +107,10 @@ class PromptedSegmentationDataset(Dataset):
         self.split_name = split_name
         self.use_prompt_variants = use_prompt_variants
         self.augment = augment
+        self.mask_cache: List[np.ndarray] = [
+            build_merged_mask((record.width, record.height), record.annotations)
+            for record in self.records
+        ]
 
     def __len__(self) -> int:
         return len(self.records)
@@ -141,10 +148,8 @@ class PromptedSegmentationDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, object]:
         record = self.records[index]
         image = Image.open(record.image_path).convert("RGB")
-        mask = build_merged_mask(
-            (record.width, record.height),
-            record.annotations,
-        )
+        # Copy before augmentation so the cached base mask remains unchanged.
+        mask = self.mask_cache[index].copy()
 
         if self.augment:
             image, mask = self._apply_augmentations(image, mask)
@@ -752,6 +757,7 @@ def main() -> None:
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= args.early_stopping_patience:
+                save_json({"history": history}, args.output_dir / "history.json")
                 print(
                     f"Early stopping at epoch {epoch} "
                     f"(no improvement for {args.early_stopping_patience} epochs)"
