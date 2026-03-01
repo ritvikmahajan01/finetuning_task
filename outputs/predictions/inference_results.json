@@ -1,0 +1,19 @@
+{
+  "avg_inference_time_ms": 54.9,
+  "cracks_dice": 0.6359,
+  "cracks_dice_std": 0.1785,
+  "cracks_iou": 0.4898,
+  "cracks_iou_std": 0.1821,
+  "drywall_dice": 0.6924,
+  "drywall_dice_std": 0.1391,
+  "drywall_iou": 0.5445,
+  "drywall_iou_std": 0.1428,
+  "macro_dice": 0.6641,
+  "macro_iou": 0.5171,
+  "split": "test",
+  "thresholds": {
+    "cracks": 0.6,
+    "drywall": 0.45
+  },
+  "total_images": 904
+}
