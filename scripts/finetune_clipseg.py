@@ -4,7 +4,7 @@ Fine-tune CLIPSeg on the combined crack + drywall datasets.
 
 This script is intentionally simple and explicit:
 - it reads the two COCO exports already present in this repository
-- it merges annotations into one binary mask per image
+- it generates binary masks on-the-fly from stored annotations (lazy, not preloaded)
 - it trains one text-conditioned model across both tasks
 - it uses prompt variants during training and canonical prompts for validation/test
 - it treats drywall labels as weak supervision because that dataset only contains boxes
@@ -29,18 +29,20 @@ import argparse
 import json
 import math
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageEnhance
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from transformers import CLIPSegForImageSegmentation, CLIPSegProcessor
 
 
+# Prompt variants taken directly from the assignment PDF.
 DATASET_CONFIGS: Dict[str, Dict[str, object]] = {
     "cracks": {
         "root": "cracks.coco/train",
@@ -49,8 +51,6 @@ DATASET_CONFIGS: Dict[str, Dict[str, object]] = {
         "prompt_variants": [
             "segment crack",
             "segment wall crack",
-            "segment structural crack",
-            "segment surface crack",
         ],
         "task_weight": 1.0,
         "positive_weight": 3.0,
@@ -64,7 +64,6 @@ DATASET_CONFIGS: Dict[str, Dict[str, object]] = {
             "segment taping area",
             "segment joint/tape",
             "segment drywall seam",
-            "segment drywall joint",
         ],
         "task_weight": 0.6,
         "positive_weight": 1.5,
@@ -78,7 +77,7 @@ class SampleRecord:
     image_path: Path
     width: int
     height: int
-    mask: np.ndarray
+    annotations: List[dict]
     dataset_name: str
     canonical_prompt: str
     prompt_variants: List[str]
@@ -90,21 +89,66 @@ class SampleRecord:
 
 class PromptedSegmentationDataset(Dataset):
     """
-    Dataset wrapper that keeps mask generation outside the training loop and
-    chooses prompt variants only for the training split.
+    Dataset wrapper that generates masks on-the-fly from stored annotations
+    and applies augmentations for the training split.
     """
 
-    def __init__(self, records: Sequence[SampleRecord], split_name: str, use_prompt_variants: bool) -> None:
+    def __init__(
+        self,
+        records: Sequence[SampleRecord],
+        split_name: str,
+        use_prompt_variants: bool,
+        augment: bool = False,
+    ) -> None:
         self.records = list(records)
         self.split_name = split_name
         self.use_prompt_variants = use_prompt_variants
+        self.augment = augment
 
     def __len__(self) -> int:
         return len(self.records)
 
+    @staticmethod
+    def _apply_augmentations(
+        image: Image.Image, mask: np.ndarray
+    ) -> Tuple[Image.Image, np.ndarray]:
+        # Random horizontal flip
+        if random.random() < 0.5:
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
+            mask = np.flip(mask, axis=1).copy()
+
+        # Random vertical flip
+        if random.random() < 0.2:
+            image = image.transpose(Image.FLIP_TOP_BOTTOM)
+            mask = np.flip(mask, axis=0).copy()
+
+        # Random rotation (+-15 degrees)
+        if random.random() < 0.3:
+            angle = random.uniform(-15, 15)
+            image = image.rotate(angle, resample=Image.BILINEAR, fillcolor=(0, 0, 0))
+            mask_pil = Image.fromarray(mask)
+            mask_pil = mask_pil.rotate(angle, resample=Image.NEAREST, fillcolor=0)
+            mask = np.array(mask_pil)
+
+        # Color jitter (image only)
+        if random.random() < 0.8:
+            image = ImageEnhance.Brightness(image).enhance(random.uniform(0.7, 1.3))
+            image = ImageEnhance.Contrast(image).enhance(random.uniform(0.7, 1.3))
+            image = ImageEnhance.Color(image).enhance(random.uniform(0.8, 1.2))
+
+        return image, mask
+
     def __getitem__(self, index: int) -> Dict[str, object]:
         record = self.records[index]
         image = Image.open(record.image_path).convert("RGB")
+        mask = build_merged_mask(
+            (record.width, record.height),
+            record.annotations,
+        )
+
+        if self.augment:
+            image, mask = self._apply_augmentations(image, mask)
+
         if self.use_prompt_variants:
             prompt = random.choice(record.prompt_variants)
         else:
@@ -112,7 +156,7 @@ class PromptedSegmentationDataset(Dataset):
 
         return {
             "image": image,
-            "mask": torch.from_numpy((record.mask > 0).astype(np.float32)),
+            "mask": torch.from_numpy((mask > 0).astype(np.float32)),
             "prompt": prompt,
             "dataset_name": record.dataset_name,
             "task_weight": torch.tensor(record.task_weight, dtype=torch.float32),
@@ -162,6 +206,24 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Threshold used to binarize sigmoid outputs during validation/test.",
     )
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=1.0,
+        help="Maximum gradient norm for clipping.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=5,
+        help="Stop training after this many epochs without validation improvement.",
+    )
+    parser.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=0.05,
+        help="Fraction of total training steps used for linear LR warmup.",
+    )
     return parser.parse_args()
 
 
@@ -210,8 +272,7 @@ def draw_bbox_mask(size: Tuple[int, int], bbox: List[float]) -> np.ndarray:
     return mask
 
 
-def build_merged_mask(image_record: dict, anns: List[dict]) -> np.ndarray:
-    size = (image_record["width"], image_record["height"])
+def build_merged_mask(size: Tuple[int, int], anns: List[dict]) -> np.ndarray:
     merged = np.zeros((size[1], size[0]), dtype=np.uint8)
     for ann in anns:
         if ann.get("segmentation"):
@@ -234,13 +295,12 @@ def build_records(limit_per_dataset: int | None) -> List[SampleRecord]:
             image_records = image_records[:limit_per_dataset]
 
         for image_record in image_records:
-            mask = build_merged_mask(image_record, ann_index.get(image_record["id"], []))
             all_records.append(
                 SampleRecord(
                     image_path=root / image_record["file_name"],
                     width=image_record["width"],
                     height=image_record["height"],
-                    mask=mask,
+                    annotations=ann_index.get(image_record["id"], []),
                     dataset_name=dataset_name,
                     canonical_prompt=str(cfg["canonical_prompt"]),
                     prompt_variants=list(cfg["prompt_variants"]),
@@ -259,9 +319,7 @@ def split_records(
     val_ratio: float,
     seed: int,
 ) -> Tuple[List[SampleRecord], List[SampleRecord], List[SampleRecord]]:
-    """
-    Split each dataset separately so the smaller drywall set is not drowned out.
-    """
+    """Split each dataset separately so the smaller drywall set is not drowned out."""
     if not (0 < train_ratio < 1) or not (0 < val_ratio < 1) or train_ratio + val_ratio >= 1:
         raise ValueError("Invalid split ratios. Require 0 < train_ratio, val_ratio and train+val < 1.")
 
@@ -281,7 +339,6 @@ def split_records(
         train_end = int(total * train_ratio)
         val_end = train_end + int(total * val_ratio)
 
-        # Keep every split non-empty when possible.
         if total >= 3:
             train_end = max(1, min(train_end, total - 2))
             val_end = max(train_end + 1, min(val_end, total - 1))
@@ -399,9 +456,6 @@ def freeze_model_for_first_pass(model: CLIPSegForImageSegmentation, unfreeze_vis
         for layer in vision_layers[-unfreeze_vision_layers:]:
             for parameter in layer.parameters():
                 parameter.requires_grad = True
-
-    # Keep projection layers trainable when any vision layers are unfrozen.
-    if unfreeze_vision_layers > 0:
         for parameter in model.clip.visual_projection.parameters():
             parameter.requires_grad = True
 
@@ -421,6 +475,7 @@ def evaluate(
     loader: DataLoader,
     device: str,
     threshold: float,
+    use_amp: bool = False,
 ) -> Dict[str, float]:
     model.eval()
     losses: List[float] = []
@@ -430,24 +485,27 @@ def evaluate(
     with torch.inference_mode():
         for batch in loader:
             batch = move_tensor_batch_to_device(batch, device)
-            outputs = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                pixel_values=batch["pixel_values"],
-            )
 
-            logits = normalize_logits_shape(outputs.logits)
-            targets = batch["masks"].unsqueeze(1)
-            logits = nn.functional.interpolate(
-                logits,
-                size=targets.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    pixel_values=batch["pixel_values"],
+                )
 
-            bce = weighted_bce_loss(logits, targets, batch["positive_weights"], batch["task_weights"])
-            dice = dice_loss(logits, targets, batch["task_weights"])
-            loss = bce + dice
+                logits = normalize_logits_shape(outputs.logits)
+                targets = batch["masks"].unsqueeze(1)
+                logits = nn.functional.interpolate(
+                    logits,
+                    size=targets.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+                bce = weighted_bce_loss(logits, targets, batch["positive_weights"], batch["task_weights"])
+                dloss = dice_loss(logits, targets, batch["task_weights"])
+                loss = bce + dloss
+
             losses.append(float(loss.item()))
 
             batch_ious, batch_dices = compute_batch_metrics(logits, targets, threshold=threshold)
@@ -459,18 +517,19 @@ def evaluate(
         "loss": float(sum(losses) / len(losses)) if losses else 0.0,
     }
 
-    all_ious: List[float] = []
-    all_dices: List[float] = []
+    # True macro average: mean of per-dataset means (not pooled across unequal sets).
+    task_ious: List[float] = []
+    task_dices: List[float] = []
     for dataset_name in sorted(per_task_iou):
         mean_iou = float(sum(per_task_iou[dataset_name]) / len(per_task_iou[dataset_name]))
         mean_dice = float(sum(per_task_dice[dataset_name]) / len(per_task_dice[dataset_name]))
         metrics[f"{dataset_name}_iou"] = mean_iou
         metrics[f"{dataset_name}_dice"] = mean_dice
-        all_ious.extend(per_task_iou[dataset_name])
-        all_dices.extend(per_task_dice[dataset_name])
+        task_ious.append(mean_iou)
+        task_dices.append(mean_dice)
 
-    metrics["macro_iou"] = float(sum(all_ious) / len(all_ious)) if all_ious else 0.0
-    metrics["macro_dice"] = float(sum(all_dices) / len(all_dices)) if all_dices else 0.0
+    metrics["macro_iou"] = float(sum(task_ious) / len(task_ious)) if task_ious else 0.0
+    metrics["macro_dice"] = float(sum(task_dices) / len(task_dices)) if task_dices else 0.0
     return metrics
 
 
@@ -488,6 +547,22 @@ def save_json(data: Dict[str, object], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2, sort_keys=True)
+
+
+def get_cosine_schedule_with_warmup(
+    optimizer: torch.optim.Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    def lr_lambda(current_step: int) -> float:
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
+        )
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def main() -> None:
@@ -516,16 +591,19 @@ def main() -> None:
         train_records,
         split_name="train",
         use_prompt_variants=True,
+        augment=True,
     )
     val_dataset = PromptedSegmentationDataset(
         val_records,
         split_name="val",
         use_prompt_variants=False,
+        augment=False,
     )
     test_dataset = PromptedSegmentationDataset(
         test_records,
         split_name="test",
         use_prompt_variants=False,
+        augment=False,
     )
 
     collate_fn = make_collate_fn(processor)
@@ -557,8 +635,18 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
 
+    # Cosine LR schedule with linear warmup.
+    total_steps = len(train_loader) * args.epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+
+    # AMP (automatic mixed precision) -- only for CUDA.
+    use_amp = "cuda" in args.device
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
     history: List[Dict[str, float]] = []
     best_val_iou = float("-inf")
+    epochs_without_improvement = 0
 
     run_config = {
         "model_id": args.model_id,
@@ -573,6 +661,10 @@ def main() -> None:
         "unfreeze_vision_layers": args.unfreeze_vision_layers,
         "eval_threshold": args.eval_threshold,
         "limit_per_dataset": args.limit_per_dataset,
+        "max_grad_norm": args.max_grad_norm,
+        "early_stopping_patience": args.early_stopping_patience,
+        "warmup_ratio": args.warmup_ratio,
+        "use_amp": use_amp,
         "trainable_parameters": trainable_params,
         "total_parameters": total_params,
         "dataset_notes": {
@@ -591,76 +683,105 @@ def main() -> None:
     }
     save_json(run_config, args.output_dir / "run_config.json")
 
+    train_start_time = time.time()
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_losses: List[float] = []
 
         for batch in train_loader:
             batch = move_tensor_batch_to_device(batch, args.device)
-            outputs = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                pixel_values=batch["pixel_values"],
-            )
 
-            logits = normalize_logits_shape(outputs.logits)
-            targets = batch["masks"].unsqueeze(1)
-            logits = nn.functional.interpolate(
-                logits,
-                size=targets.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    pixel_values=batch["pixel_values"],
+                )
 
-            bce = weighted_bce_loss(logits, targets, batch["positive_weights"], batch["task_weights"])
-            dice = dice_loss(logits, targets, batch["task_weights"])
-            loss = bce + dice
+                logits = normalize_logits_shape(outputs.logits)
+                targets = batch["masks"].unsqueeze(1)
+                logits = nn.functional.interpolate(
+                    logits,
+                    size=targets.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+                bce = weighted_bce_loss(logits, targets, batch["positive_weights"], batch["task_weights"])
+                dloss = dice_loss(logits, targets, batch["task_weights"])
+                loss = bce + dloss
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad],
+                max_norm=args.max_grad_norm,
+            )
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
 
             epoch_losses.append(float(loss.item()))
 
         train_loss = float(sum(epoch_losses) / len(epoch_losses)) if epoch_losses else 0.0
-        val_metrics = evaluate(model, val_loader, device=args.device, threshold=args.eval_threshold)
+        val_metrics = evaluate(
+            model, val_loader, device=args.device, threshold=args.eval_threshold, use_amp=use_amp,
+        )
         epoch_summary: Dict[str, float] = {"epoch": float(epoch), "train_loss": train_loss}
         epoch_summary.update({f"val_{key}": value for key, value in val_metrics.items()})
         history.append(epoch_summary)
 
+        current_lr = scheduler.get_last_lr()[0]
         print(
             f"epoch={epoch} "
             f"train_loss={train_loss:.4f} "
             f"val_loss={val_metrics['loss']:.4f} "
             f"val_macro_iou={val_metrics['macro_iou']:.4f} "
-            f"val_macro_dice={val_metrics['macro_dice']:.4f}"
+            f"val_macro_dice={val_metrics['macro_dice']:.4f} "
+            f"lr={current_lr:.2e}"
         )
 
         if val_metrics["macro_iou"] > best_val_iou:
             best_val_iou = val_metrics["macro_iou"]
+            epochs_without_improvement = 0
             model.save_pretrained(args.output_dir / "best_model")
             processor.save_pretrained(args.output_dir / "best_model")
             save_json(epoch_summary, args.output_dir / "best_model" / "best_val_metrics.json")
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= args.early_stopping_patience:
+                print(
+                    f"Early stopping at epoch {epoch} "
+                    f"(no improvement for {args.early_stopping_patience} epochs)"
+                )
+                break
 
-        save_json(
-            {
-                "history": history,
-            },
-            args.output_dir / "history.json",
-        )
+        save_json({"history": history}, args.output_dir / "history.json")
 
-    # Reuse the in-memory model if no best checkpoint was saved for some reason.
+    train_elapsed = time.time() - train_start_time
+    print(f"training_time={train_elapsed:.1f}s")
+
+    # Load best model for final test evaluation.
     best_model_dir = args.output_dir / "best_model"
     if best_model_dir.exists():
         model = CLIPSegForImageSegmentation.from_pretrained(best_model_dir)
         model.to(args.device)
 
-    test_metrics = evaluate(model, test_loader, device=args.device, threshold=args.eval_threshold)
+    test_metrics = evaluate(
+        model, test_loader, device=args.device, threshold=args.eval_threshold, use_amp=use_amp,
+    )
+    test_metrics["training_time_seconds"] = round(train_elapsed, 1)
     save_json(test_metrics, args.output_dir / "test_metrics.json")
 
     print("test_metrics")
     for key in sorted(test_metrics):
-        print(f"{key}={test_metrics[key]:.4f}")
+        value = test_metrics[key]
+        if isinstance(value, float):
+            print(f"  {key}={value:.4f}")
+        else:
+            print(f"  {key}={value}")
 
 
 if __name__ == "__main__":

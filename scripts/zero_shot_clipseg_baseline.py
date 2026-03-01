@@ -154,18 +154,16 @@ def create_overlay(
     color: Tuple[int, int, int],
     alpha: int = 110,
 ) -> Image.Image:
-    base = image.convert("RGBA")
-    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    overlay_pixels = overlay.load()
+    base = np.array(image.convert("RGB"), dtype=np.float32)
     mask_bool = mask > 0
-
-    width, height = base.size
-    for y in range(height):
-        for x in range(width):
-            if mask_bool[y, x]:
-                overlay_pixels[x, y] = (color[0], color[1], color[2], alpha)
-
-    return Image.alpha_composite(base, overlay).convert("RGB")
+    alpha_f = alpha / 255.0
+    for c in range(3):
+        base[..., c] = np.where(
+            mask_bool,
+            base[..., c] * (1.0 - alpha_f) + color[c] * alpha_f,
+            base[..., c],
+        )
+    return Image.fromarray(base.astype(np.uint8))
 
 
 def save_visualization(
